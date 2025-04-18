@@ -149,6 +149,7 @@ async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
 
     # --- Load System Prompt from config.json (if available) ---
     system_prompt = None
+    system_prompt_added_this_session = False # Flag to track if we print it
     if CONFIG_FILE.exists():
         try:
             config_data = json.loads(CONFIG_FILE.read_text())
@@ -158,12 +159,13 @@ async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
         except json.JSONDecodeError:
             print(f"[⚠] Error reading {CONFIG_FILE}")
         except Exception as e:
-            print(f"[⚠] Error loading config {CONFIG_FILE}: {e}")
+            print(f"[⚠] Error loading config {CONFIG_FILE}: {e}") # Keep non-colored
 
     # Prepend system prompt if loaded and not already present
     if system_prompt and (not data["messages"] or data["messages"][0].get("role") != "system"):
         data["messages"].insert(0, {"role": "system", "content": system_prompt})
-        print("[✓] Added system prompt to messages.")
+        # print("[✓] Added system prompt to messages.") # Optional internal log
+        system_prompt_added_this_session = True # Mark for printing
     # ---------------------------------------------------------
 
     # MCP setup (if requested)
@@ -176,21 +178,31 @@ async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
             Path(mcp_cfg_path).expanduser()
         )
 
-    # ① prompt banner (colored)
+    # --- Print Initial Chat Info ---
     print(clr(f"\n── Chat {cid} ({model}) – /exit to quit, /save to save ──\n",
               Style.BRIGHT, Fore.BLUE))
+
+    # Print System Prompt if applicable
+    if system_prompt_added_this_session:
+         print(clr(f"[System] {system_prompt}", Fore.YELLOW)) # System prompt style
+         print() # Add a newline after system prompt
+
     loop = asyncio.get_event_loop()
     try:
         while True:
+            # --- Get User Input ---
             try:
-                # ② user prompt (colored)
                 user_input = await loop.run_in_executor(None, input, clr("› ", Fore.GREEN))
                 user_input = user_input.strip()
             except (EOFError, KeyboardInterrupt):
-                print("\n[Interrupted]"); break
+                print("\n[Interrupted]"); break # Keep non-colored
             if user_input in {"/exit","exit","quit",":q"}: break
-            if user_input == "/save": _save(data,path); print("[✓] Saved"); continue
+            if user_input == "/save": _save(data,path); print("[✓] Saved"); continue # Keep non-colored
             if not user_input: continue
+
+            # --- Display User Input --- 
+            print(clr(f"[User] {user_input}", Fore.GREEN)) # User message style
+            print() # Add space after user message
 
             data["messages"].append({"role":"user","content":user_input})
 
@@ -199,7 +211,8 @@ async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
             current_tool_call_args = {} # To handle arguments split across chunks
 
             try:
-                print(clr("Assistant: ", Fore.CYAN), end="", flush=True) # Start assistant line
+                # --- Initial Assistant Response Stream ---
+                print(clr("[Assistant]", Fore.CYAN), end=" ", flush=True) # Assistant label
 
                 response_stream = client.chat.completions.create(
                     model=model,
@@ -217,7 +230,7 @@ async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
 
                     # --- Accumulate Content ---
                     if delta.content:
-                        print(clr(delta.content, Fore.CYAN), end="", flush=True)
+                        print(clr(delta.content, Fore.CYAN), end="", flush=True) # Stream content
                         assistant_message_accumulator["content"] += delta.content
 
                     # --- Accumulate Tool Calls ---
@@ -284,6 +297,7 @@ async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
                             arguments_str = call["function"]["arguments"]
                             arguments = json.loads(arguments_str or "{}")
                         except json.JSONDecodeError:
+                             # Keep error printing non-colored or use RED
                              print(clr(f"\n[!] Invalid JSON arguments received for tool {name}: {arguments_str}", Fore.RED))
                              tool_messages_to_append.append({
                                  "role": "tool",
@@ -302,8 +316,8 @@ async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
                              })
                             continue # Skip this tool call
 
-                        # ③ tool routing line (colored)
-                        print(clr(f"\n[tool:{srv.name}] {name}({arguments})", Fore.MAGENTA))
+                        # Print Formatted Tool Call
+                        print(clr(f"\n[Tool Call: {srv.name}] {name}({arguments})", Fore.MAGENTA)) # Tool call style
 
                         # --- call the tool on the correct MCP server ---
                         try:
@@ -321,6 +335,8 @@ async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
                                 return "\n".join(lines) or "<empty tool result>"
 
                             result_text = _to_text(tool_result)
+                            # Tool output itself is not printed directly, only the call is logged.
+                            # The result is sent back to the model via the tool message.
 
                             # Append tool result message
                             tool_messages_to_append.append(
@@ -343,7 +359,8 @@ async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
                     data["messages"].extend(tool_messages_to_append)
 
                     # --- Ask the model to continue (Streaming) ---
-                    print(clr("Assistant: ", Fore.CYAN), end="", flush=True) # Start follow-up line
+                    print(clr("\n[Assistant]", Fore.CYAN), end=" ", flush=True) # Assistant label for follow-up
+
                     final_assistant_msg = {"role": "assistant", "content": ""}
 
                     followup_stream = client.chat.completions.create(
@@ -354,7 +371,7 @@ async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
                     for chunk in followup_stream:
                          delta = chunk.choices[0].delta
                          if delta.content:
-                              print(clr(delta.content, Fore.CYAN), end="", flush=True)
+                              print(clr(delta.content, Fore.CYAN), end="", flush=True) # Stream content
                               final_assistant_msg["content"] += delta.content
 
                     print() # Newline after streaming final response
