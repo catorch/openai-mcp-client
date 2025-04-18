@@ -147,24 +147,28 @@ async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
     model = data.get("model", "gpt-4o")
     client = OpenAI()
 
-    # --- Load System Prompt from config.json (if available) ---
-    system_prompt = None
+    # --- Load System Prompt --- 
+    system_prompt_content = None
     system_prompt_added_this_session = False # Flag to track if we print it
     if CONFIG_FILE.exists():
         try:
             config_data = json.loads(CONFIG_FILE.read_text())
-            system_prompt = config_data.get("system_prompt")
-            if system_prompt:
-                print(f"[✓] Loaded system prompt from {CONFIG_FILE}")
+            system_prompt_content = config_data.get("system_prompt") # Get original content
+            # Removed print here, will be printed below if added
         except json.JSONDecodeError:
             print(f"[⚠] Error reading {CONFIG_FILE}")
         except Exception as e:
             print(f"[⚠] Error loading config {CONFIG_FILE}: {e}") # Keep non-colored
 
-    # Prepend system prompt if loaded and not already present
-    if system_prompt and (not data["messages"] or data["messages"][0].get("role") != "system"):
-        data["messages"].insert(0, {"role": "system", "content": system_prompt})
-        # print("[✓] Added system prompt to messages.") # Optional internal log
+    # Prepend system prompt if needed
+    if system_prompt_content and (not data["messages"] or data["messages"][0].get("role") != "system"):
+        ts_sys = _now() # Timestamp for system message
+        formatted_sys_content = f"[{ts_sys}] {system_prompt_content}"
+        data["messages"].insert(0, {
+            "role": "system", 
+            "content": formatted_sys_content, # Timestamp prepended
+            "timestamp": ts_sys             # Timestamp as metadata
+        })
         system_prompt_added_this_session = True # Mark for printing
     # ---------------------------------------------------------
 
@@ -179,12 +183,10 @@ async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
         )
 
     # --- Print Initial Chat Info ---
-    print(clr(f"\n── Chat {cid} ({model}) – /exit to quit, /save to save ──\n",
-              Style.BRIGHT, Fore.BLUE))
-
-    # Print System Prompt if applicable
+    print(clr(f"\n── Chat {cid} ({model}) – /exit to quit, /save to save ──\n", Style.BRIGHT, Fore.BLUE))
     if system_prompt_added_this_session:
-         print(clr(f"[System] {system_prompt}", Fore.YELLOW)) # System prompt style
+         # Display the system prompt content (which now includes the timestamp)
+         print(clr(f"[System] {data['messages'][0]['content']}", Fore.YELLOW))
          print() # Add a newline after system prompt
 
     loop = asyncio.get_event_loop()
@@ -200,15 +202,23 @@ async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
             if user_input == "/save": _save(data,path); print("[✓] Saved"); continue # Keep non-colored
             if not user_input: continue
 
-            # --- Display User Input --- 
-            print(clr(f"[User] {user_input}", Fore.GREEN)) # User message style
+            # --- Prepare and Store User Message ---
+            ts_user = _now()
+            formatted_user_content = f"[{ts_user}] {user_input}"
+            print(clr(f"[User] {formatted_user_content}", Fore.GREEN)) # Display with timestamp
             print() # Add space after user message
 
-            data["messages"].append({"role":"user","content":user_input})
+            data["messages"].append({
+                "role":"user",
+                "content": formatted_user_content, # Timestamp prepended
+                "timestamp": ts_user             # Timestamp as metadata
+            })
 
+            # --- Prepare for Assistant Response ---
             assistant_message_accumulator = defaultdict(str)
             tool_calls_accumulator = []
-            current_tool_call_args = {} # To handle arguments split across chunks
+            current_tool_call_args = {}
+            ts_assistant_initial = _now() # Timestamp before API call
 
             try:
                 # --- Initial Assistant Response Stream ---
@@ -216,24 +226,20 @@ async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
 
                 response_stream = client.chat.completions.create(
                     model=model,
-                    messages=data["messages"],
+                    messages=data["messages"], # Send history (now with timestamps in content)
                     tools=tools_json,
-                    stream=True, # <-- STREAM ENABLED
+                    stream=True,
                 )
 
                 finish_reason = None
+                # --- Process Stream --- 
                 for chunk in response_stream:
                     delta = chunk.choices[0].delta
-                    # Handle potential None for finish_reason in some chunks
                     if chunk.choices[0].finish_reason is not None:
                         finish_reason = chunk.choices[0].finish_reason
-
-                    # --- Accumulate Content ---
                     if delta.content:
-                        print(clr(delta.content, Fore.CYAN), end="", flush=True) # Stream content
+                        print(clr(delta.content, Fore.CYAN), end="", flush=True) 
                         assistant_message_accumulator["content"] += delta.content
-
-                    # --- Accumulate Tool Calls ---
                     if delta.tool_calls:
                         for tool_call_chunk in delta.tool_calls:
                             index = tool_call_chunk.index
@@ -261,9 +267,9 @@ async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
                                     current_tool_call_args[index] += tool_call_chunk.function.arguments
                                     # Keep arguments accumulator separate until the end
 
-                print() # Newline after streaming assistant response
+                print() # Newline after assistant stream
 
-                # --- Store Accumulated Assistant Message ---
+                # --- Store Accumulated Assistant Message --- 
                 # Consolidate final arguments after stream ends
                 for i, call in enumerate(tool_calls_accumulator):
                    if i in current_tool_call_args:
@@ -272,23 +278,25 @@ async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
                    if call["id"] is None:
                        call["id"] = f"call_{uuid.uuid4().hex[:6]}"
 
+                accumulated_content = assistant_message_accumulator["content"]
+                # Prepend timestamp only if there's actual text content
+                formatted_assistant_content = f"[{ts_assistant_initial}] {accumulated_content}" if accumulated_content else None
 
                 assistant_message = {
                     "role": "assistant",
-                    "content": assistant_message_accumulator["content"] or None, # None if only tool calls
+                    "content": formatted_assistant_content, # Timestamp prepended (if content exists)
+                    "timestamp": ts_assistant_initial      # Timestamp as metadata
                 }
-                # Add tool_calls ONLY if they were actually received and accumulated
                 if tool_calls_accumulator:
-                   assistant_message["tool_calls"] = tool_calls_accumulator
-
+                   assistant_message["tool_calls"] = tool_calls_accumulator # Tool calls don't get timestamp prepended
+                
                 data["messages"].append(assistant_message)
 
-
-                # --- Handle Tool Calls (if finish_reason was tool_calls) ---
+                # --- Handle Tool Calls ---
                 if finish_reason == "tool_calls":
-                    tool_messages_to_append = [] # Collect tool results before follow-up
+                    tool_messages_to_append = [] 
+                    # ts_tools_start = _now() # Timestamp for the batch isn't strictly needed per message
 
-                    # Use the accumulated tool calls
                     for call in tool_calls_accumulator:
                         name = call["function"]["name"]
                         call_id = call["id"]
@@ -302,7 +310,8 @@ async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
                              tool_messages_to_append.append({
                                  "role": "tool",
                                  "tool_call_id": call_id,
-                                 "content": f"Error: Invalid JSON arguments received: {arguments_str}"
+                                 "content": f"Error: Invalid JSON arguments received: {arguments_str}",
+                                 "timestamp": _now() # Timestamp for this specific error
                              })
                              continue # Skip this tool call
 
@@ -312,8 +321,9 @@ async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
                             tool_messages_to_append.append({
                                 "role": "tool",
                                 "tool_call_id": call_id,
-                                "content": f"Error: Unknown tool '{name}'"
-                             })
+                                "content": f"Error: Unknown tool '{name}'",
+                                "timestamp": _now() # Timestamp for this specific error
+                            })
                             continue # Skip this tool call
 
                         # Print Formatted Tool Call
@@ -338,47 +348,58 @@ async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
                             # Tool output itself is not printed directly, only the call is logged.
                             # The result is sent back to the model via the tool message.
 
-                            # Append tool result message
-                            tool_messages_to_append.append(
-                                {
+                            # --- Prepare and Store Tool Result Message ---
+                            ts_tool_result = _now() # Timestamp for this specific result
+                            formatted_tool_content = f"[{ts_tool_result}] {result_text}"
+
+                            tool_messages_to_append.append({
                                     "role": "tool",
                                     "tool_call_id": call_id,
-                                    "content": result_text,
-                                }
-                            )
+                                    "content": formatted_tool_content, # Timestamp prepended
+                                    "timestamp": ts_tool_result       # Timestamp as metadata
+                                })
                         except Exception as tool_err:
                              print(clr(f"\n[!] Error calling tool {name}: {tool_err}", Fore.RED))
+                             # Also add timestamp to error message content
+                             ts_tool_error = _now()
+                             error_content = f"Error executing tool '{name}': {tool_err}"
+                             formatted_error_content = f"[{ts_tool_error}] {error_content}"
                              tool_messages_to_append.append({
                                  "role": "tool",
                                  "tool_call_id": call_id,
-                                 "content": f"Error executing tool '{name}': {tool_err}"
+                                 "content": formatted_error_content, # Timestamp prepended
+                                 "timestamp": ts_tool_error        # Timestamp as metadata
                              })
 
-
-                    # Add all tool results to messages
                     data["messages"].extend(tool_messages_to_append)
 
                     # --- Ask the model to continue (Streaming) ---
+                    ts_assistant_final = _now() # Timestamp before follow-up call
                     print(clr("\n[Assistant]", Fore.CYAN), end=" ", flush=True) # Assistant label for follow-up
 
-                    final_assistant_msg = {"role": "assistant", "content": ""}
-
+                    final_assistant_msg_content = "" # Accumulator for final content
                     followup_stream = client.chat.completions.create(
                         model=model,
-                        messages=data["messages"],
-                        stream=True, # <-- STREAM ENABLED
+                        messages=data["messages"], # Send history including tool results
+                        stream=True,
                     )
+                    # --- Process Follow-up Stream --- 
                     for chunk in followup_stream:
                          delta = chunk.choices[0].delta
                          if delta.content:
                               print(clr(delta.content, Fore.CYAN), end="", flush=True) # Stream content
-                              final_assistant_msg["content"] += delta.content
+                              final_assistant_msg_content += delta.content
+                    
+                    print() # Newline after final stream
 
-                    print() # Newline after streaming final response
-                    # Append final assistant message only if it has content
-                    if final_assistant_msg["content"]:
-                        data["messages"].append(final_assistant_msg)
-
+                    # --- Store Final Assistant Message --- 
+                    if final_assistant_msg_content:
+                         formatted_final_content = f"[{ts_assistant_final}] {final_assistant_msg_content}"
+                         data["messages"].append({
+                             "role": "assistant",
+                             "content": formatted_final_content, # Timestamp prepended
+                             "timestamp": ts_assistant_final      # Timestamp as metadata
+                         })
 
             except (RateLimitError, APITimeoutError, APIError) as e:
                 print(clr(f"\n[ERROR] {e}\n", Fore.RED))
@@ -399,7 +420,7 @@ async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
              for i, res in enumerate(results):
                  if isinstance(res, Exception):
                      print(f"[⚠] Error cleaning up server {live_servers[i].name}: {res}")
-        _save(data, path)
+        _save(data, path) # Save the history with timestamps
         print(f"[✓] Saved to {path}")
 
 # ---------- CLI ----------
