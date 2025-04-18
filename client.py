@@ -19,6 +19,7 @@ from pathlib import Path
 # New imports
 # ---------------------------------------------------------------------------
 from typing import Dict, Any, Tuple, List, Optional, Union
+from collections import defaultdict
 
 # --- Colors ------------------------------------------------------------------
 try:
@@ -139,7 +140,6 @@ async def prepare_mcp_servers(config_path: Path) -> tuple[
 
 
 # ---------- Chat loop ----------
-# ---------------------------------------------------------------------------
 # Updated chat_loop signature and MCP setup
 # ---------------------------------------------------------------------------
 async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
@@ -194,83 +194,194 @@ async def chat_loop(cid: str, mcp_cfg_path: Optional[str]):
 
             data["messages"].append({"role":"user","content":user_input})
 
+            assistant_message_accumulator = defaultdict(str)
+            tool_calls_accumulator = []
+            current_tool_call_args = {} # To handle arguments split across chunks
+
             try:
-                response = client.chat.completions.create(
+                print(clr("Assistant: ", Fore.CYAN), end="", flush=True) # Start assistant line
+
+                response_stream = client.chat.completions.create(
                     model=model,
                     messages=data["messages"],
-                    tools=tools_json, # Use the combined tools list
-                    stream=False,
+                    tools=tools_json,
+                    stream=True, # <-- STREAM ENABLED
                 )
-            except (RateLimitError, APITimeoutError, APIError) as e:
-                print(f"\n[ERROR] {e}\n"); data["messages"].pop(); continue
 
-            msg = response.choices[0].message
-            # Handle tool calls (if any)
-            if getattr(msg, "tool_calls", None):
-                # IMPORTANT: Add the assistant message with tool_calls before tool responses
-                data["messages"].append(msg.model_dump()) # Use model_dump() for Pydantic v2
+                finish_reason = None
+                for chunk in response_stream:
+                    delta = chunk.choices[0].delta
+                    # Handle potential None for finish_reason in some chunks
+                    if chunk.choices[0].finish_reason is not None:
+                        finish_reason = chunk.choices[0].finish_reason
 
-                for call in msg.tool_calls:
-                    if call.type!="function": continue
-                    name = call.function.name
-                    arguments = json.loads(call.function.arguments or "{}")
-                    
-                    # ---------------------------------------------------------------------------
-                    # Updated tool call routing logic
-                    # ---------------------------------------------------------------------------
-                    srv = tool_to_server.get(name)
-                    if not srv:
-                        print(f"[✗] Unknown tool: {name}")
-                        # Optionally send an error message back to the model?
-                        # data["messages"].append({"role": "tool", "tool_call_id": call.id, "content": f"Error: Unknown tool '{name}'"})
-                        continue # Skip this tool call
+                    # --- Accumulate Content ---
+                    if delta.content:
+                        print(clr(delta.content, Fore.CYAN), end="", flush=True)
+                        assistant_message_accumulator["content"] += delta.content
 
-                    # ③ tool routing line (colored)
-                    print(clr(f"[tool:{srv.name}] {name}({arguments})", Fore.MAGENTA))
-                    
-                    # --- call the tool on the correct MCP server ---
-                    tool_result = await srv.call_tool(name, arguments)
+                    # --- Accumulate Tool Calls ---
+                    if delta.tool_calls:
+                        for tool_call_chunk in delta.tool_calls:
+                            index = tool_call_chunk.index
+                            # Initialize tool call structure if seeing this index for the first time
+                            if index >= len(tool_calls_accumulator):
+                                tool_calls_accumulator.append({
+                                    "id": None, # Will be filled later if provided
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""}
+                                })
+                                current_tool_call_args[index] = "" # Initialize accumulator for this index
 
-                    # Flatten CallToolResult → plain string for the Chat API
-                    def _to_text(result: Any) -> str:
-                        lines = []
-                        for item in getattr(result, "content", []):
-                            # TextContent is the common case
-                            if getattr(item, "type", None) == "text":
-                                lines.append(item.text)
-                            else:                       # fallback: stringify any other item
-                                lines.append(str(item))
-                        return "\n".join(lines) or "<empty tool result>"
+                            # Safely access the current accumulator entry
+                            current_call = tool_calls_accumulator[index]
 
-                    result_text = _to_text(tool_result)
+                            # Update fields if present in the chunk
+                            if hasattr(tool_call_chunk, 'id') and tool_call_chunk.id:
+                                current_call["id"] = tool_call_chunk.id
+                            if hasattr(tool_call_chunk, 'type') and tool_call_chunk.type:
+                                current_call["type"] = tool_call_chunk.type # Though likely always 'function'
+                            if tool_call_chunk.function:
+                                if tool_call_chunk.function.name:
+                                    current_call["function"]["name"] = tool_call_chunk.function.name
+                                if tool_call_chunk.function.arguments:
+                                    current_tool_call_args[index] += tool_call_chunk.function.arguments
+                                    # Keep arguments accumulator separate until the end
 
-                    # Send the tool output back to the model
-                    data["messages"].append(
-                        {
-                            "role": "tool",          # ← required role for tool responses
-                            "tool_call_id": call.id,
-                            "content": result_text,
-                        }
+                print() # Newline after streaming assistant response
+
+                # --- Store Accumulated Assistant Message ---
+                # Consolidate final arguments after stream ends
+                for i, call in enumerate(tool_calls_accumulator):
+                   if i in current_tool_call_args:
+                        call["function"]["arguments"] = current_tool_call_args[i]
+                   # Assign a default ID if none was received
+                   if call["id"] is None:
+                       call["id"] = f"call_{uuid.uuid4().hex[:6]}"
+
+
+                assistant_message = {
+                    "role": "assistant",
+                    "content": assistant_message_accumulator["content"] or None, # None if only tool calls
+                }
+                # Add tool_calls ONLY if they were actually received and accumulated
+                if tool_calls_accumulator:
+                   assistant_message["tool_calls"] = tool_calls_accumulator
+
+                data["messages"].append(assistant_message)
+
+
+                # --- Handle Tool Calls (if finish_reason was tool_calls) ---
+                if finish_reason == "tool_calls":
+                    tool_messages_to_append = [] # Collect tool results before follow-up
+
+                    # Use the accumulated tool calls
+                    for call in tool_calls_accumulator:
+                        name = call["function"]["name"]
+                        call_id = call["id"]
+                        try:
+                            # Ensure arguments are valid JSON before parsing
+                            arguments_str = call["function"]["arguments"]
+                            arguments = json.loads(arguments_str or "{}")
+                        except json.JSONDecodeError:
+                             print(clr(f"\n[!] Invalid JSON arguments received for tool {name}: {arguments_str}", Fore.RED))
+                             tool_messages_to_append.append({
+                                 "role": "tool",
+                                 "tool_call_id": call_id,
+                                 "content": f"Error: Invalid JSON arguments received: {arguments_str}"
+                             })
+                             continue # Skip this tool call
+
+                        srv = tool_to_server.get(name)
+                        if not srv:
+                            print(clr(f"\n[✗] Unknown tool: {name}", Fore.RED))
+                            tool_messages_to_append.append({
+                                "role": "tool",
+                                "tool_call_id": call_id,
+                                "content": f"Error: Unknown tool '{name}'"
+                             })
+                            continue # Skip this tool call
+
+                        # ③ tool routing line (colored)
+                        print(clr(f"\n[tool:{srv.name}] {name}({arguments})", Fore.MAGENTA))
+
+                        # --- call the tool on the correct MCP server ---
+                        try:
+                            tool_result = await srv.call_tool(name, arguments)
+
+                            # Flatten CallToolResult → plain string for the Chat API
+                            # Ensure _to_text is defined correctly within or accessible to chat_loop
+                            def _to_text(result: Any) -> str:
+                                lines = []
+                                for item in getattr(result, "content", []):
+                                    if getattr(item, "type", None) == "text":
+                                        lines.append(item.text)
+                                    else:
+                                        lines.append(str(item))
+                                return "\n".join(lines) or "<empty tool result>"
+
+                            result_text = _to_text(tool_result)
+
+                            # Append tool result message
+                            tool_messages_to_append.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": call_id,
+                                    "content": result_text,
+                                }
+                            )
+                        except Exception as tool_err:
+                             print(clr(f"\n[!] Error calling tool {name}: {tool_err}", Fore.RED))
+                             tool_messages_to_append.append({
+                                 "role": "tool",
+                                 "tool_call_id": call_id,
+                                 "content": f"Error executing tool '{name}': {tool_err}"
+                             })
+
+
+                    # Add all tool results to messages
+                    data["messages"].extend(tool_messages_to_append)
+
+                    # --- Ask the model to continue (Streaming) ---
+                    print(clr("Assistant: ", Fore.CYAN), end="", flush=True) # Start follow-up line
+                    final_assistant_msg = {"role": "assistant", "content": ""}
+
+                    followup_stream = client.chat.completions.create(
+                        model=model,
+                        messages=data["messages"],
+                        stream=True, # <-- STREAM ENABLED
                     )
-                
-                # Ask the model to continue the conversation
-                followup = client.chat.completions.create(
-                    model=model,
-                    messages=data["messages"],
-                    stream=False,
-                )
-                msg = followup.choices[0].message
-            
-            # ④ assistant reply (colored)
-            print(clr(msg.content, Fore.CYAN))
-            data["messages"].append({"role":"assistant","content":msg.content})
+                    for chunk in followup_stream:
+                         delta = chunk.choices[0].delta
+                         if delta.content:
+                              print(clr(delta.content, Fore.CYAN), end="", flush=True)
+                              final_assistant_msg["content"] += delta.content
+
+                    print() # Newline after streaming final response
+                    # Append final assistant message only if it has content
+                    if final_assistant_msg["content"]:
+                        data["messages"].append(final_assistant_msg)
+
+
+            except (RateLimitError, APITimeoutError, APIError) as e:
+                print(clr(f"\n[ERROR] {e}\n", Fore.RED))
+                # Avoid popping if messages might be partially processed due to stream error
+                # Consider how to handle partial message saving or retries
+            except Exception as e:
+                 print(clr(f"\n[UNEXPECTED ERROR] {e}\n", Fore.RED))
+                 # Consider logging traceback for unexpected errors
+                 # import traceback; traceback.print_exc()
+
+
     finally:
-        # ---------------------------------------------------------------------------
-        # Updated cleanup logic
-        # ---------------------------------------------------------------------------
+        # Graceful cleanup
         if live_servers:
              print("[MCP] Cleaning up servers...")
-             await asyncio.gather(*(srv.cleanup() for srv in live_servers), return_exceptions=True)
+             # Use return_exceptions=True for gather
+             results = await asyncio.gather(*(srv.cleanup() for srv in live_servers), return_exceptions=True)
+             for i, res in enumerate(results):
+                 if isinstance(res, Exception):
+                     print(f"[⚠] Error cleaning up server {live_servers[i].name}: {res}")
         _save(data, path)
         print(f"[✓] Saved to {path}")
 
